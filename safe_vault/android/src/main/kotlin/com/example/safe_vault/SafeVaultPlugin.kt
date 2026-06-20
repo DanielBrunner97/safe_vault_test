@@ -2,9 +2,12 @@ package com.example.safe_vault // Make sure this matches your generated package 
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.biometric.BiometricManager
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.Log
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
@@ -20,15 +23,16 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import androidx.core.content.edit
 
-class SafeVaultPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
-    private lateinit var channel : MethodChannel
+class SafeVaultPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+    private lateinit var channel: MethodChannel
     private lateinit var context: Context
     private var activity: FragmentActivity? = null
-    
+
     private val keyStoreAlias = "safe_vault_master_key"
     private val prefsName = "safe_vault_prefs"
-    
+
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, "safe_vault")
         channel.setMethodCallHandler(this)
@@ -36,47 +40,105 @@ class SafeVaultPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
     }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
-        val key = call.argument<String>("key") ?: return result.error("invalid_args", "Missing key", null)
         val prefs = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
 
         when (call.method) {
             "saveSecret" -> {
+                val key = call.argument<String>("key") ?: return result.error("invalid_args", "Missing key", null)
                 val secret = call.argument<String>("secret") ?: return result.success(false)
-                saveSecret(key, secret, prefs, result)
+
+                // Extract AndroidOptions
+                val title = call.argument<String>("title") ?: "Authenticate"
+                val subtitle = call.argument<String>("subtitle") ?: ""
+                val description = call.argument<String>("description") ?: ""
+                val cancelText = call.argument<String>("negativeButtonText") ?: "Cancel"
+
+                saveSecret(key, secret, title, subtitle, description, cancelText, prefs, result)
             }
-            "getSecret" -> getSecret(key, prefs, result)
+
+            "getSecret" -> {
+                val key = call.argument<String>("key") ?: return result.error("invalid_args", "Missing key", null)
+
+                // Extract AndroidOptions
+                val title = call.argument<String>("title") ?: "Unlock data"
+                val subtitle = call.argument<String>("subtitle") ?: ""
+                val description = call.argument<String>("description") ?: ""
+                val cancelText = call.argument<String>("negativeButtonText") ?: "Cancel"
+
+                getSecret(key, title, subtitle, description, cancelText, prefs, result)
+            }
+
             "deleteSecret" -> {
-                prefs.edit().remove(key).remove("${key}_iv").apply()
+                val key = call.argument<String>("key") ?: return result.error("invalid_args", "Missing key", null)
+                prefs.edit { remove(key).remove("${key}_iv") }
                 result.success(true)
             }
+
+            "isBiometricAvailable" -> {
+                val biometricManager = BiometricManager.from(context)
+                // We specifically check for BIOMETRIC_STRONG to perfectly match our Keystore rules
+                val status = biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                Log.d("SAFE_VAULT", "STATUS (Enrolled Check): $status")
+
+                result.success(status == BiometricManager.BIOMETRIC_SUCCESS)
+            }
+
+            "isDeviceSupported" -> {
+                val biometricManager = BiometricManager.from(context)
+                val status = biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+
+                // It is supported as long as it doesn't explicitly tell us the hardware is missing
+                result.success(status != BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE)
+            }
+
             else -> result.notImplemented()
         }
     }
 
     // --- Core Operations --- //
 
-    private fun saveSecret(key: String, secret: String, prefs: SharedPreferences, result: Result) {
+    private fun saveSecret(
+        key: String,
+        secret: String,
+        title: String,
+        subtitle: String,
+        description: String,
+        cancelText: String,
+        prefs: SharedPreferences,
+        result: Result
+    ) {
         try {
-            val secretKey = getOrCreateKey()
+            var secretKey = getOrCreateKey()
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
 
-            showBiometricPrompt("Authenticate to secure your data", cipher) { cryptoObject ->
+            try {
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            } catch (e: KeyPermanentlyInvalidatedException) {
+                Log.w("SAFE_VAULT", "Master key invalidated by new biometric enrollment. Regenerating...")
+                val keyStore = KeyStore.getInstance("AndroidKeyStore")
+                keyStore.load(null)
+                keyStore.deleteEntry(keyStoreAlias)
+                secretKey = getOrCreateKey()
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            }
+
+            // Pass the extracted UI strings instead of the hardcoded title
+            showBiometricPrompt(title, subtitle, description, cancelText, cipher) { cryptoObject ->
+                // ... the rest of this block remains exactly the same ...
                 if (cryptoObject == null) {
                     result.success(false)
                     return@showBiometricPrompt
                 }
-                
+
                 try {
                     val encryptedBytes = cryptoObject.cipher?.doFinal(secret.toByteArray())
                     val ivBytes = cryptoObject.cipher?.iv
 
-                    // Save IV and Ciphertext to SharedPreferences
-                    prefs.edit()
-                        .putString(key, Base64.encodeToString(encryptedBytes, Base64.DEFAULT))
-                        .putString("${key}_iv", Base64.encodeToString(ivBytes, Base64.DEFAULT))
-                        .apply()
-                        
+                    prefs.edit {
+                        putString(key, Base64.encodeToString(encryptedBytes, Base64.DEFAULT))
+                        putString("${key}_iv", Base64.encodeToString(ivBytes, Base64.DEFAULT))
+                    }
+
                     result.success(true)
                 } catch (e: Exception) {
                     result.success(false)
@@ -87,7 +149,15 @@ class SafeVaultPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
         }
     }
 
-    private fun getSecret(key: String, prefs: SharedPreferences, result: Result) {
+    private fun getSecret(
+        key: String,
+        title: String,
+        subtitle: String,
+        description: String,
+        cancelText: String,
+        prefs: SharedPreferences,
+        result: Result
+    ) {
         val encryptedBase64 = prefs.getString(key, null)
         val ivBase64 = prefs.getString("${key}_iv", null)
 
@@ -99,62 +169,73 @@ class SafeVaultPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
             val secretKey = getOrCreateKey()
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             val iv = Base64.decode(ivBase64, Base64.DEFAULT)
-            
-            // [XIAOMI BUG CATCHER STAGE 1] 
-            // If the hardware keystore desyncs, it often fails right here during initialization.
+
             cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, iv))
 
-            showBiometricPrompt("Unlock your secure data", cipher) { cryptoObject ->
+            // Pass the extracted UI strings
+            showBiometricPrompt(title, subtitle, description, cancelText, cipher) { cryptoObject ->
+                // ... the rest of this block remains exactly the same ...
                 if (cryptoObject == null) {
                     result.success(null)
                     return@showBiometricPrompt
                 }
-                
+
                 try {
                     val encryptedBytes = Base64.decode(encryptedBase64, Base64.DEFAULT)
-                    // [XIAOMI BUG CATCHER STAGE 2]
-                    // If it makes it past initialization, it fails here during the MAC/Tag check.
                     val decryptedBytes = cryptoObject.cipher?.doFinal(encryptedBytes)
                     result.success(String(decryptedBytes!!))
                 } catch (e: Exception) {
-                    // CATCH AEADBadTagException and KeyStoreException!
-                    // Delete the corrupted data so the user isn't permanently locked out
-                    prefs.edit().remove(key).remove("${key}_iv").apply()
+                    prefs.edit { remove(key).remove("${key}_iv") }
                     result.error("hardware_desync", "Hardware Keystore desynchronized. Data wiped.", null)
                 }
             }
         } catch (e: Exception) {
-            // Catch initialization errors and wipe data
-            prefs.edit().remove(key).remove("${key}_iv").apply()
+            prefs.edit { remove(key).remove("${key}_iv") }
             result.error("hardware_desync", "Cipher initialization failed. Data wiped.", null)
         }
     }
 
     // --- Biometric UI & Keystore Helpers --- //
 
-    private fun showBiometricPrompt(title: String, cipher: Cipher, onComplete: (BiometricPrompt.CryptoObject?) -> Unit) {
+    private fun showBiometricPrompt(
+        title: String,
+        subtitle: String,
+        description: String,
+        cancelText: String,
+        cipher: Cipher,
+        onComplete: (BiometricPrompt.CryptoObject?) -> Unit
+    ) {
         val fragmentActivity = activity ?: return onComplete(null)
         val executor = ContextCompat.getMainExecutor(context)
-        
-        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+
+        // Build the base prompt
+        val promptInfoBuilder = BiometricPrompt.PromptInfo.Builder()
             .setTitle(title)
-            .setAllowedAuthenticators(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG)
-            .setNegativeButtonText("Cancel")
-            .build()
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .setNegativeButtonText(cancelText)
+
+        // Only add subtitle and description if the user provided them in Dart
+        if (subtitle.isNotEmpty()) {
+            promptInfoBuilder.setSubtitle(subtitle)
+        }
+        if (description.isNotEmpty()) {
+            promptInfoBuilder.setDescription(description)
+        }
+
+        val promptInfo = promptInfoBuilder.build()
 
         val biometricPrompt = BiometricPrompt(fragmentActivity, executor, object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                 onComplete(result.cryptoObject)
             }
+
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                 onComplete(null)
             }
         })
 
-        // Pass the Cipher into the CryptoObject so the hardware Keystore unlocks it!
         biometricPrompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
     }
-
     private fun getOrCreateKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore")
         keyStore.load(null)
@@ -180,11 +261,19 @@ class SafeVaultPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activity = binding.activity as? FragmentActivity
     }
-    override fun onDetachedFromActivityForConfigChanges() { activity = null }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activity = null
+    }
+
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         activity = binding.activity as? FragmentActivity
     }
-    override fun onDetachedFromActivity() { activity = null }
+
+    override fun onDetachedFromActivity() {
+        activity = null
+    }
+
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
     }

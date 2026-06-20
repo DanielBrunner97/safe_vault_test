@@ -51,6 +51,32 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
         case "deleteSecret":
             result(delete(key: key))
 
+        case "isBiometricAvailable":
+            let context = LAContext()
+            var error: NSError?
+            let canEvaluate = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
+            result(canEvaluate)
+
+        case "isDeviceSupported":
+            let context = LAContext()
+            var error: NSError?
+            let canEvaluate = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
+            
+            if canEvaluate {
+                // It evaluated successfully, so the hardware exists and is ready
+                result(true)
+            } else {
+                // It failed. Let's check WHY it failed.
+                if let laError = error as? LAError, laError.code == .biometryNotAvailable {
+                    // The device physically does not have Face ID / Touch ID
+                    result(false)
+                } else {
+                    // It failed for another reason (e.g., biometryNotEnrolled, biometryLockout)
+                    // This means the physical hardware DOES exist.
+                    result(true)
+                }
+            }
+
         default:
             result(FlutterMethodNotImplemented)
         }
