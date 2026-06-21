@@ -123,27 +123,26 @@ class SafeVaultPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             }
 
             // Pass the extracted UI strings instead of the hardcoded title
-            showBiometricPrompt(title, subtitle, description, cancelText, cipher) { cryptoObject ->
-                // ... the rest of this block remains exactly the same ...
-                if (cryptoObject == null) {
-                    result.success(false)
-                    return@showBiometricPrompt
-                }
+            showBiometricPrompt(
+                title, subtitle, description, cancelText, cipher,
+                onError = { code, message ->
+                    result.error(code, message, null)
+                },
+                onSuccess = { cryptoObject ->
+                    try {
+                        val encryptedBytes = cryptoObject.cipher?.doFinal(secret.toByteArray())
+                        val ivBytes = cryptoObject.cipher?.iv
 
-                try {
-                    val encryptedBytes = cryptoObject.cipher?.doFinal(secret.toByteArray())
-                    val ivBytes = cryptoObject.cipher?.iv
-
-                    prefs.edit {
-                        putString(key, Base64.encodeToString(encryptedBytes, Base64.DEFAULT))
-                        putString("${key}_iv", Base64.encodeToString(ivBytes, Base64.DEFAULT))
+                        prefs.edit {
+                            putString(key, Base64.encodeToString(encryptedBytes, Base64.DEFAULT))
+                            putString("${key}_iv", Base64.encodeToString(ivBytes, Base64.DEFAULT))
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("encrypt_error", e.localizedMessage, null)
                     }
-
-                    result.success(true)
-                } catch (e: Exception) {
-                    result.success(false)
                 }
-            }
+            )
         } catch (e: Exception) {
             result.error("encrypt_error", e.localizedMessage, null)
         }
@@ -173,22 +172,24 @@ class SafeVaultPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, iv))
 
             // Pass the extracted UI strings
-            showBiometricPrompt(title, subtitle, description, cancelText, cipher) { cryptoObject ->
-                // ... the rest of this block remains exactly the same ...
-                if (cryptoObject == null) {
-                    result.success(null)
-                    return@showBiometricPrompt
+            showBiometricPrompt(
+                                title, subtitle, description, cancelText, cipher,
+                onError = { code, message ->
+                    result.error(code, message, null)
+                },
+                onSuccess = { cryptoObject ->
+                    try {
+                        // We decode the saved base64 string, we do NOT use "secret" here
+                        val encryptedBytes = Base64.decode(encryptedBase64, Base64.DEFAULT)
+                        val decryptedBytes = cryptoObject.cipher?.doFinal(encryptedBytes)
+                        
+                        result.success(String(decryptedBytes!!))
+                    } catch (e: Exception) {
+                        prefs.edit { remove(key).remove("${key}_iv") }
+                        result.error("hardware_desync", "Hardware Keystore desynchronized. Data wiped.", null)
+                    }
                 }
-
-                try {
-                    val encryptedBytes = Base64.decode(encryptedBase64, Base64.DEFAULT)
-                    val decryptedBytes = cryptoObject.cipher?.doFinal(encryptedBytes)
-                    result.success(String(decryptedBytes!!))
-                } catch (e: Exception) {
-                    prefs.edit { remove(key).remove("${key}_iv") }
-                    result.error("hardware_desync", "Hardware Keystore desynchronized. Data wiped.", null)
-                }
-            }
+            )
         } catch (e: Exception) {
             prefs.edit { remove(key).remove("${key}_iv") }
             result.error("hardware_desync", "Cipher initialization failed. Data wiped.", null)
@@ -203,39 +204,49 @@ class SafeVaultPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         description: String,
         cancelText: String,
         cipher: Cipher,
-        onComplete: (BiometricPrompt.CryptoObject?) -> Unit
+        onError: (String, String) -> Unit, // Add error callback
+        onSuccess: (BiometricPrompt.CryptoObject) -> Unit
     ) {
-        val fragmentActivity = activity ?: return onComplete(null)
+        val fragmentActivity = activity ?: return onError("activity_error", "Activity not attached")
         val executor = ContextCompat.getMainExecutor(context)
 
-        // Build the base prompt
         val promptInfoBuilder = BiometricPrompt.PromptInfo.Builder()
             .setTitle(title)
             .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
             .setNegativeButtonText(cancelText)
 
-        // Only add subtitle and description if the user provided them in Dart
-        if (subtitle.isNotEmpty()) {
-            promptInfoBuilder.setSubtitle(subtitle)
-        }
-        if (description.isNotEmpty()) {
-            promptInfoBuilder.setDescription(description)
-        }
+        if (subtitle.isNotEmpty()) promptInfoBuilder.setSubtitle(subtitle)
+        if (description.isNotEmpty()) promptInfoBuilder.setDescription(description)
 
         val promptInfo = promptInfoBuilder.build()
 
-        val biometricPrompt = BiometricPrompt(fragmentActivity, executor, object : BiometricPrompt.AuthenticationCallback() {
-            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                onComplete(result.cryptoObject)
-            }
+        val biometricPrompt =
+            BiometricPrompt(fragmentActivity, executor, object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    if (result.cryptoObject != null) {
+                        onSuccess(result.cryptoObject!!)
+                    } else {
+                        onError("auth_error", "CryptoObject was null")
+                    }
+                }
 
-            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                onComplete(null)
-            }
-        })
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    val flutterCode = when (errorCode) {
+                        BiometricPrompt.ERROR_USER_CANCELED,
+                        BiometricPrompt.ERROR_NEGATIVE_BUTTON -> "user_canceled"
+
+                        BiometricPrompt.ERROR_NO_BIOMETRICS,
+                        BiometricPrompt.ERROR_HW_UNAVAILABLE -> "no_biometrics"
+
+                        else -> "auth_error"
+                    }
+                    onError(flutterCode, errString.toString())
+                }
+            })
 
         biometricPrompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
     }
+
     private fun getOrCreateKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore")
         keyStore.load(null)

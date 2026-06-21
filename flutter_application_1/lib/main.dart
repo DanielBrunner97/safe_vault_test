@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:safe_vault/android_options.dart';
 // 1. Import your custom plugin
 import 'package:safe_vault/safe_vault.dart';
+import 'package:safe_vault/safe_vault_exceptions.dart';
 
 void main() {
   runApp(const MyApp());
@@ -33,7 +34,6 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   int _counter = 0;
 
-  // 2. Initialize the vault and a state variable for the UI
   final SafeVault _safeVault = SafeVault();
   String _vaultStatus = 'Nothing read yet.';
 
@@ -43,55 +43,108 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
+  // Helper method to easily show snackbars
+  void _showSnackBar(String message, {bool isError = true}) {
+    if (!mounted) return; // Always check if mounted after async gaps!
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red.shade800 : Colors.green.shade800,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
   // --- 3. Add the SafeVault Methods --- //
 
   Future<void> _saveToVault() async {
-    // We will save the current counter value as the secret
     final secretData = 'My secret counter is: $_counter';
-    final success = await _safeVault.saveSecret(
-      key: 'demo_key_secure',
-      secret: secretData,
-    );
 
-    setState(() {
-      if (success) {
-        _vaultStatus = 'Saved: "$secretData"';
-      } else {
-        _vaultStatus = 'Failed to save secret (Cancelled or Error).';
-      }
-    });
+    try {
+      final success = await _safeVault.saveSecret(
+        key: 'demo_key_secure',
+        secret: secretData,
+      );
+
+      setState(() {
+        if (success) {
+          _vaultStatus = 'Saved: "$secretData"';
+          _showSnackBar('Secret saved successfully!', isError: false);
+        } else {
+          _vaultStatus = 'Failed to save secret.';
+        }
+      });
+    } on SafeVaultException catch (e) {
+      setState(() => _vaultStatus = 'Save failed.');
+
+      // Dart 3 Exhaustive Pattern Matching!
+      final errorMessage = switch (e) {
+        VaultUserCanceledException() => 'Save cancelled by user.',
+        VaultNoBiometricsException() =>
+          'Biometrics not available on this device.',
+        VaultAuthException() => 'Authentication failed. Could not save.',
+        VaultHardwareDesyncException() =>
+          'Device security changed. Keys invalidated.',
+        VaultUnknownException() => 'Unknown error: ${e.message}',
+      };
+
+      _showSnackBar(errorMessage);
+    }
   }
 
   Future<void> _readFromVault() async {
-    final secret = await _safeVault.getSecret(
-      key: 'demo_key_secure',
-      androidOptions: AndroidOptions(
-        title: 'Unlock your secret counter!',
-        subtitle: 'Please authenticate to view your secret counter value.',
-        description: 'This is a demo of the Safe Vault plugin.',
-        negativeButtonText: 'No, thanks',
-      ),
-    );
+    try {
+      final secret = await _safeVault.getSecret(
+        key: 'demo_key_secure',
+        androidOptions: const AndroidOptions(
+          title: 'Unlock your secret counter!',
+          subtitle: 'Please authenticate to view your secret counter value.',
+          description: 'This is a demo of the Safe Vault plugin.',
+          negativeButtonText: 'No, thanks',
+        ),
+      );
 
-    setState(() {
-      if (secret != null) {
-        _vaultStatus = 'Unlocked: $secret';
-      } else {
-        _vaultStatus = 'Read failed. (Cancelled, missing, or hardware error)';
-      }
-    });
+      setState(() {
+        if (secret != null) {
+          _vaultStatus = 'Unlocked: $secret';
+          _showSnackBar('Secret unlocked!', isError: false);
+        } else {
+          _vaultStatus = 'No secret found in vault.';
+        }
+      });
+    } on SafeVaultException catch (e) {
+      setState(() => _vaultStatus = 'Read failed.');
+
+      // Map the sealed exceptions to user-friendly messages
+      final errorMessage = switch (e) {
+        VaultUserCanceledException() => 'Authentication cancelled.',
+        VaultNoBiometricsException() =>
+          'Please enable Face ID / Touch ID in settings.',
+        VaultAuthException() => 'Authentication failed. Please try again.',
+        VaultHardwareDesyncException() =>
+          'Biometrics changed! Vault data was safely wiped.',
+        VaultUnknownException() => 'An unknown error occurred: ${e.message}',
+      };
+
+      _showSnackBar(errorMessage);
+    }
   }
 
   Future<void> _deleteFromVault() async {
-    final success = await _safeVault.deleteSecret(key: 'demo_key_secure');
+    try {
+      final success = await _safeVault.deleteSecret(key: 'demo_key_secure');
 
-    setState(() {
-      if (success) {
-        _vaultStatus = 'Vault cleared successfully.';
-      } else {
-        _vaultStatus = 'Failed to clear vault.';
-      }
-    });
+      setState(() {
+        if (success) {
+          _vaultStatus = 'Vault cleared successfully.';
+          _showSnackBar('Vault cleared.', isError: false);
+        } else {
+          _vaultStatus = 'Failed to clear vault.';
+        }
+      });
+    } on SafeVaultException catch (e) {
+      _showSnackBar('Error deleting secret: ${e.message}');
+    }
   }
 
   // ---> NEW HARDWARE CHECKS <---
@@ -108,7 +161,6 @@ class _MyHomePageState extends State<MyHomePage> {
       _vaultStatus = 'Biometric Enrolled & Ready: $isAvailable';
     });
   }
-
   // --- 4. Build the UI --- //
 
   @override

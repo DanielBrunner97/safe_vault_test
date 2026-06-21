@@ -41,10 +41,14 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
 
         case "getSecret":
             NSLog("SAFE_VAULT: getSecret using readWithPrompt")
-
-            readWithPrompt(key: key) { secret in
+            
+            readWithPrompt(key: key) { secret, error in
                 DispatchQueue.main.async {
-                    result(secret)
+                    if let error = error {
+                        result(error)
+                    } else {
+                        result(secret)
+                    }
                 }
             }
 
@@ -135,46 +139,41 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
         return status == errSecSuccess
     }
 
-    private func readWithPrompt(key: String, completion: @escaping (String?) -> Void) {
+    private func readWithPrompt(key: String, completion: @escaping (String?, FlutterError?) -> Void) {
         NSLog("SAFE_VAULT: readWithPrompt started")
 
         let context = LAContext()
         context.localizedReason = "Unlock to access your secure data"
-
-        // Try to prevent reuse of recent Face ID auth.
         context.touchIDAuthenticationAllowableReuseDuration = 0
 
         var authError: NSError?
-
-        let canEvaluate = context.canEvaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics,
-            error: &authError
-        )
-
-        NSLog("SAFE_VAULT: canEvaluatePolicy: \(canEvaluate)")
-        NSLog("SAFE_VAULT: authError: \(String(describing: authError))")
+        let canEvaluate = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &authError)
 
         guard canEvaluate else {
-            completion(nil)
+            completion(nil, FlutterError(code: "no_biometrics", message: "Biometrics not available", details: nil))
             return
         }
 
-        NSLog("SAFE_VAULT: about to call evaluatePolicy")
-
-        context.evaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics,
-            localizedReason: "Unlock to access your secure data"
-        ) { success, error in
-            NSLog("SAFE_VAULT: evaluatePolicy callback")
-            NSLog("SAFE_VAULT: biometric success: \(success)")
-            NSLog("SAFE_VAULT: biometric error: \(String(describing: error))")
-
-            guard success else {
-                completion(nil)
+        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Unlock to access your secure data") { success, error in
+            if let laError = error as? LAError {
+                let errorCode: String
+                switch laError.code {
+                case .userCancel, .appCancel, .systemCancel:
+                    errorCode = "user_canceled"
+                case .biometryNotAvailable, .biometryNotEnrolled:
+                    errorCode = "no_biometrics"
+                default:
+                    errorCode = "auth_error"
+                }
+                
+                completion(nil, FlutterError(code: errorCode, message: laError.localizedDescription, details: nil))
                 return
             }
 
-            NSLog("SAFE_VAULT: about to read keychain")
+            guard success else {
+                completion(nil, FlutterError(code: "auth_error", message: "Authentication failed", details: nil))
+                return
+            }
 
             let query: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
@@ -189,16 +188,13 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
             var item: CFTypeRef?
             let status = SecItemCopyMatching(query as CFDictionary, &item)
 
-            NSLog("SAFE_VAULT: keychain read status: \(status)")
-
-            guard status == errSecSuccess,
-                  let data = item as? Data else {
-                completion(nil)
+            guard status == errSecSuccess, let data = item as? Data else {
+                completion(nil, nil) 
                 return
             }
 
             let secret = String(data: data, encoding: .utf8)
-            completion(secret)
+            completion(secret, nil)
         }
     }
 
