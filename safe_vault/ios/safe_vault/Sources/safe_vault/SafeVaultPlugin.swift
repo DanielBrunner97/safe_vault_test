@@ -20,26 +20,22 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         NSLog("SAFE_VAULT: method called: \(call.method)")
 
-        guard let args = call.arguments as? [String: Any],
-              let key = args["key"] as? String else {
-            result(FlutterError(
-                code: "invalid_args",
-                message: "Missing arguments",
-                details: nil
-            ))
-            return
-        }
+        let args = call.arguments as? [String: Any]
 
         switch call.method {
         case "saveSecret":
-            guard let secret = args["secret"] as? String else {
-                result(false)
+            guard let key = args?["key"] as? String,
+                let secret = args?["secret"] as? String else {
+                result(FlutterError(code: "invalid_args", message: "Missing key or secret", details: nil))
                 return
             }
-
             result(save(key: key, secret: secret))
 
         case "getSecret":
+            guard let key = args?["key"] as? String else {
+                result(FlutterError(code: "invalid_args", message: "Missing key", details: nil))
+                return
+            }
             NSLog("SAFE_VAULT: getSecret using readWithPrompt")
             
             readWithPrompt(key: key) { secret, error in
@@ -53,6 +49,10 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
             }
 
         case "deleteSecret":
+            guard let key = args?["key"] as? String else {
+                result(FlutterError(code: "invalid_args", message: "Missing key", details: nil))
+                return
+            }
             result(delete(key: key))
 
         case "isBiometricAvailable":
@@ -67,16 +67,11 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
             let canEvaluate = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
             
             if canEvaluate {
-                // It evaluated successfully, so the hardware exists and is ready
                 result(true)
             } else {
-                // It failed. Let's check WHY it failed.
                 if let laError = error as? LAError, laError.code == .biometryNotAvailable {
-                    // The device physically does not have Face ID / Touch ID
                     result(false)
                 } else {
-                    // It failed for another reason (e.g., biometryNotEnrolled, biometryLockout)
-                    // This means the physical hardware DOES exist.
                     result(true)
                 }
             }
@@ -189,7 +184,13 @@ public class SafeVaultPlugin: NSObject, FlutterPlugin {
             let status = SecItemCopyMatching(query as CFDictionary, &item)
 
             guard status == errSecSuccess, let data = item as? Data else {
-                completion(nil, nil) 
+                // If it fails here, the biometrics changed OR the item never existed.
+                // We return your 'hardware_desync' code so Dart can handle it safely.
+                completion(nil, FlutterError(
+                    code: "hardware_desync", 
+                    message: "Biometric set changed or item not found. Key invalidated.", 
+                    details: nil
+                ))
                 return
             }
 
